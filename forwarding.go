@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
@@ -33,6 +35,10 @@ func main() {
 		err = runClient(os.Args[2], os.Args[3])
 	case "-e":
 		err = runEcho(os.Args[2])
+	case "-p":
+		err = runPing(os.Args[2])
+	case "-proxy":
+		err = runProxy(os.Args[2], os.Args[3])
 	default:
 		err = fmt.Errorf("not supported command:%v", os.Args[1])
 	}
@@ -75,6 +81,7 @@ func runClient(listen, target string) (err error) {
 	if err != nil {
 		return
 	}
+	fmt.Printf("start accept by listen:%v,target:%v\n", listen, target)
 	var conn net.Conn
 	for {
 		conn, err = listener.Accept()
@@ -96,10 +103,13 @@ func runClient(listen, target string) (err error) {
 				conn.Close()
 				return
 			}
-			go procCopy(remote, conn)
-			procCopy(conn, remote)
+			fmt.Printf("start process forwarding to %v from %v\n", target, conn.RemoteAddr())
+			go procCopy(conn, remote)
+			err = procCopy(remote, conn)
+			fmt.Printf("forwarding to %v from %v is stop by %v\n", target, conn.RemoteAddr(), err)
 		}()
 	}
+	fmt.Printf("accept end by listen:%v,target:%v\n", listen, target)
 	return
 }
 
@@ -123,8 +133,111 @@ func runEcho(listen string) (err error) {
 	return
 }
 
-func procCopy(src io.ReadCloser, dst io.WriteCloser) {
-	io.Copy(dst, src)
+func runPing(remote string) (err error) {
+	remoteURL, err := url.Parse(remote)
+	if err != nil {
+		return
+	}
+	conn, err := net.Dial(remoteURL.Scheme, remoteURL.Host)
+	if err != nil {
+		return
+	}
+	go func() {
+		reader := bufio.NewReader(conn)
+		for {
+			line, _, err := reader.ReadLine()
+			if err != nil {
+				break
+			}
+			fmt.Printf("%v\n", string(line))
+		}
+		conn.Close()
+	}()
+	for {
+		fmt.Fprintf(conn, "sending--->\n")
+		time.Sleep(time.Second)
+	}
+}
+
+func procCopy(src io.ReadCloser, dst io.WriteCloser) (err error) {
+	_, err = io.Copy(dst, src)
 	src.Close()
 	dst.Close()
+	return
+}
+
+func procPrintCopy(name string, src io.ReadCloser, dst io.WriteCloser) (err error) {
+	_, err = printCopy(name, src, dst)
+	src.Close()
+	dst.Close()
+	return
+}
+
+func printCopy(name string, src io.ReadCloser, dst io.WriteCloser) (written int64, err error) {
+	buf := make([]byte, 64*1024)
+	for {
+		nr, er := src.Read(buf)
+		if nr > 0 {
+			fmt.Printf("[%v]Receiive %v\n", name, string(buf[0:nr]))
+			nw, ew := dst.Write(buf[0:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if ew != nil {
+				err = ew
+				break
+			}
+			if nr != nw {
+				err = io.ErrShortWrite
+				break
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				err = er
+			}
+			break
+		}
+	}
+	return
+}
+
+func runProxy(listen, target string) (err error) {
+	fmt.Printf("start proxy mode by listen:%v,target:%v\n", listen, target)
+	listenURL, err := url.Parse(listen)
+	if err != nil {
+		return
+	}
+	targetURL, err := url.Parse(target)
+	if err != nil {
+		return
+	}
+	listener, err := net.Listen(listenURL.Scheme, listenURL.Host)
+	if err != nil {
+		return
+	}
+	fmt.Printf("start accept by listen:%v,target:%v\n", listen, target)
+	var conn net.Conn
+	for {
+		conn, err = listener.Accept()
+		if err != nil {
+			break
+		}
+		fmt.Printf("accept connection from %v\n", conn.RemoteAddr())
+		go func() {
+			fmt.Printf("start forwarding to %v from %v\n", target, conn.RemoteAddr())
+			remote, err := net.Dial(targetURL.Scheme, targetURL.Host)
+			if err != nil {
+				fmt.Printf("dail to %v fail with %v\n", target, err)
+				conn.Close()
+				return
+			}
+			fmt.Printf("start process forwarding to %v from %v\n", target, conn.RemoteAddr())
+			go procPrintCopy("C2R", conn, remote)
+			err = procPrintCopy("R2C", remote, conn)
+			fmt.Printf("forwarding to %v from %v is stop by %v\n", target, conn.RemoteAddr(), err)
+		}()
+	}
+	fmt.Printf("accept end by listen:%v,target:%v\n", listen, target)
+	return
 }
